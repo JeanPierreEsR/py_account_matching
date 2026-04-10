@@ -100,7 +100,10 @@ def parse_pasted_block(prompt: str, default_prefix: str, use_last_only: bool = T
             if last == "-":
                 cols = [0.0]
             else:
-                cols = [parse_number(last)]
+                try:
+                    cols = [parse_number(last)]
+                except Exception:
+                    cols = [0.0]
         else:
             # All columns after the first name column are numeric features
             cols: List[float] = []
@@ -327,14 +330,14 @@ def main():
         print("Use only the last column as value? (y/n) [y]: ", end="")
         use_last_only = (input().strip().lower() or "y").startswith("y")
 
-        source_a = parse_pasted_block("Copy Source A now, then press Enter.", "Source A Item", use_last_only)
+        source_a = parse_pasted_block("Copy Source A (target values) now, then press Enter.", "Source A Item", use_last_only)
         if not source_a:
-            print("No Source A data provided. Exiting.")
+            print("No Source A (target values) data provided. Exiting.")
             return
 
-        source_b = parse_pasted_block("Copy Source B now, then press Enter.", "Source B Item", use_last_only)
+        source_b = parse_pasted_block("Copy Source B (accounts to loop through) now, then press Enter.", "Source B Item", use_last_only)
         if not source_b:
-            print("No Source B data provided. Exiting.")
+            print("No Source B (accounts to loop through) data provided. Exiting.")
             return
 
         solve_for_targets(source_a, source_b, use_last_only=use_last_only)
