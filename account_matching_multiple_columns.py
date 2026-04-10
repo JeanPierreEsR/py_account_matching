@@ -313,11 +313,11 @@ def solve_for_targets(source_a, source_b, use_last_only: bool = True):
         else:  # vector mode
             best_sum, idxs = meet_in_the_middle_best_vec(a_vals, vals_b)
             diffs = [best_sum[d] - a_vals[d] for d in range(dim)]
-            lines.append("BEST_TOTAL\t" + "\t".join(f"{x:.6f}" for x in best_sum))
-            lines.append("DIFF\t" + "\t".join(f"{x:.6f}" for x in diffs))
-            lines.append(f"COUNT\t{len(idxs)}")
+            lines.append("BEST_TOTAL\t\t" + "\t".join(f"{x:.6f}" for x in best_sum))
+            lines.append("DIFF\t\t" + "\t".join(f"{x:.6f}" for x in diffs))
+            lines.append(f"COUNT\t\t{len(idxs)}")
             for i in idxs:
-                lines.append(f"{names_b[i]}\t" + "\t".join(f"{x:.6f}" for x in vals_b[i]))
+                lines.append(f"{names_b[i]}\t\t" + "\t".join(f"{x:.6f}" for x in vals_b[i]))
         lines.append("")
 
     output_tsv = "\n".join(lines).rstrip("\n")
