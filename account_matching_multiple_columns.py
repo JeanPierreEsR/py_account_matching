@@ -321,6 +321,7 @@ def solve_for_targets(source_a, source_b, use_last_only: bool = True):
         lines.append("")
 
     output_tsv = "\n".join(lines).rstrip("\n")
+    input("Results ready. Press Enter to copy to clipboard...")
     write_clipboard_text(output_tsv)
 
 # --------- Main ---------
