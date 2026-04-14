@@ -2,26 +2,27 @@
 import win32clipboard
 import re
 from bisect import bisect_left
-from typing import List, Tuple
+from collections import defaultdict
+from typing import Dict, List, Optional, Tuple
 import sys
 
 # --------- Regex for numbers ---------
 NUM_RE = re.compile(r"""
     ^\s*
-    (?P<open_par>\()?        
+    (?P<open_par>\()?
     \s*
-    (?P<sign>-)?             
+    (?P<sign>-)?
     \s*
-    [\$€£]*                  
+    [\$€£]*
     \s*
     (?:S/\.)?
     \s*
-    (?P<int>\d{1,3}(?:[.,]\d{3})*|\d+) 
-    (?P<dec>[.,]\d+)?        
+    (?P<int>\d{1,3}(?:[.,]\d{3})*|\d+)
+    (?P<dec>[.,]\d+)?
     \s*
-    %?                       
+    %?
     \s*
-    \)?                      
+    \)?
     \s*$
 """, re.VERBOSE)
 
@@ -33,7 +34,7 @@ TRAILING_NUM_RE = re.compile(r"""
         [\$€£]*\s*
         (?:S/\.)?\s*
         (?P<int>\d{1,3}(?:[.,]\d{3})*|\d+)
-        (?P<dec>[.,]\d+)? 
+        (?P<dec>[.,]\d+)?
         \s*%?\s*
         \)?\s*
     )$
@@ -146,48 +147,97 @@ def all_subset_sums(values: List[float]) -> List[Tuple[float, int]]:
         out.append((s, mask))
     return out
 
-def meet_in_the_middle_best(target: float, vals: List[float]) -> Tuple[float, List[int]]:
+
+def meet_in_the_middle_top_k(
+    target: float,
+    vals: List[float],
+    k: int = 1,
+    required_count: Optional[int] = None,
+) -> List[Tuple[float, List[int]]]:
+    """
+    Returns up to k best (total, sorted_indices) subsets ordered by |total - target|.
+    If required_count is given, only subsets of exactly that size are considered.
+    Uses a window search around the binary-search position; window = max(k*10, 50).
+    """
     n = len(vals)
     mid = n // 2
     left_vals = vals[:mid]
     right_vals = vals[mid:]
-    left_sums = all_subset_sums(left_vals)
+
+    left_sums = all_subset_sums(left_vals)   # includes empty subset (0.0, 0)
     right_sums = all_subset_sums(right_vals)
-    right_sums.sort(key=lambda x: x[0])
-    right_only = [s for s, _ in right_sums]
-    best_err = float("inf")
-    best_total = 0.0
-    best_left_mask = 0
-    best_right_mask = 0
+
+    # Group right sums by popcount for fast required_count lookup
+    right_by_count: Dict[int, List[Tuple[float, int]]] = defaultdict(list)
+    for rs, rmask in right_sums:
+        right_by_count[bin(rmask).count('1')].append((rs, rmask))
+    for c in right_by_count:
+        right_by_count[c].sort()
+
+    # Sorted all right sums (for unconstrained case)
+    right_sums_sorted = sorted(right_sums, key=lambda x: x[0])
+    right_only = [s for s, _ in right_sums_sorted]
+
+    window = max(k * 10, 50)
+    candidates: List[Tuple[float, float, int, int]] = []  # (err, abs_total, lmask, rmask)
+
     for ls, lmask in left_sums:
+        lcount = bin(lmask).count('1')
         need = target - ls
-        pos = bisect_left(right_only, need)
-        for j in (pos-1, pos, pos+1):
-            if 0 <= j < len(right_sums):
-                rs, rmask = right_sums[j]
+
+        if required_count is not None:
+            needed_rcount = required_count - lcount
+            if needed_rcount < 0 or needed_rcount > len(right_vals):
+                continue
+            rlist = right_by_count.get(needed_rcount, [])
+            if not rlist:
+                continue
+            rvals = [s for s, _ in rlist]
+            pos = bisect_left(rvals, need)
+            for j in range(max(0, pos - window), min(len(rlist), pos + window + 1)):
+                rs, rmask = rlist[j]
                 total = ls + rs
-                err = abs(total - target)
-                if err < best_err or (err == best_err and abs(total) < abs(best_total)):
-                    best_err = err
-                    best_total = total
-                    best_left_mask = lmask
-                    best_right_mask = rmask
-    chosen_indices: List[int] = []
-    i, m = 0, best_left_mask
-    while i < len(left_vals):
-        if m & 1:
-            chosen_indices.append(i)
-        m >>= 1; i += 1
-    i, m = 0, best_right_mask
-    while i < len(right_vals):
-        if m & 1:
-            chosen_indices.append(mid + i)
-        m >>= 1; i += 1
-    return best_total, sorted(chosen_indices)
+                candidates.append((abs(total - target), abs(total), lmask, rmask))
+        else:
+            pos = bisect_left(right_only, need)
+            for j in range(max(0, pos - window), min(len(right_sums_sorted), pos + window + 1)):
+                rs, rmask = right_sums_sorted[j]
+                total = ls + rs
+                candidates.append((abs(total - target), abs(total), lmask, rmask))
+
+    candidates.sort()
+
+    results: List[Tuple[float, List[int]]] = []
+    seen: set = set()
+    for _, _, lmask, rmask in candidates:
+        key = (lmask, rmask)
+        if key in seen:
+            continue
+        seen.add(key)
+        idxs: List[int] = []
+        i, m = 0, lmask
+        while i < len(left_vals):
+            if m & 1:
+                idxs.append(i)
+            m >>= 1; i += 1
+        i, m = 0, rmask
+        while i < len(right_vals):
+            if m & 1:
+                idxs.append(mid + i)
+            m >>= 1; i += 1
+        total = sum(vals[idx] for idx in idxs)
+        results.append((total, sorted(idxs)))
+        if len(results) >= k:
+            break
+
+    return results
+
 
 # --------- Vector MITM ---------
 def all_subset_sums_vec(values: List[List[float]]) -> List[Tuple[List[float], int]]:
     n = len(values)
+    if n == 0:
+        return []
     dim = len(values[0])
     out: List[Tuple[List[float], int]] = []
     for mask in range(1 << n):
@@ -207,80 +257,106 @@ def all_subset_sums_vec(values: List[List[float]]) -> List[Tuple[List[float], in
 def squared_error(vec1: List[float], vec2: List[float]) -> float:
     return sum((a - b) ** 2 for a, b in zip(vec1, vec2))
 
-def meet_in_the_middle_best_vec(target: List[float], vals: List[List[float]]) -> Tuple[List[float], List[int]]:
+
+def meet_in_the_middle_top_k_vec(
+    target: List[float],
+    vals: List[List[float]],
+    k: int = 1,
+    required_count: Optional[int] = None,
+) -> List[Tuple[List[float], List[int]]]:
+    """
+    Returns up to k best (sum_vec, sorted_indices) ordered by squared error from target.
+    If required_count is given, only subsets of exactly that size are considered.
+    """
     n = len(vals)
     dim = len(target)
     mid = n // 2
     left_vals = vals[:mid]
     right_vals = vals[mid:]
 
-    left_sums = all_subset_sums_vec(left_vals)
+    # Handle empty left half (when n == 1)
+    left_sums: List[Tuple[List[float], int]] = (
+        all_subset_sums_vec(left_vals) if left_vals else [([0.0] * dim, 0)]
+    )
     right_sums = all_subset_sums_vec(right_vals)
 
-    # Optimization: Sort right_sums by the first dimension to allow pruning
-    right_sums.sort(key=lambda x: x[0][0])
-    right_first_vals = [x[0][0] for x in right_sums]
+    # Group right sums by popcount
+    right_by_count: Dict[int, List[Tuple[List[float], int]]] = defaultdict(list)
+    for rv, rmask in right_sums:
+        right_by_count[bin(rmask).count('1')].append((rv, rmask))
+    for c in right_by_count:
+        right_by_count[c].sort(key=lambda x: x[0][0])
 
-    best_err = float("inf")
-    best_sum = [0.0] * dim
-    best_lmask = 0
-    best_rmask = 0
+    # Sorted all right sums by first dimension (for unconstrained case)
+    right_sums_sorted = sorted(right_sums, key=lambda x: x[0][0])
+    right_first_vals = [x[0][0] for x in right_sums_sorted]
+
+    window = max(k * 10, 50)
+    candidates: List[Tuple[float, int, int]] = []  # (err, lmask, rmask)
 
     for ls, lmask in left_sums:
-        # We need: ls[0] + rs[0] ≈ target[0]  =>  rs[0] ≈ target[0] - ls[0]
+        lcount = bin(lmask).count('1')
         target_r0 = target[0] - ls[0]
-        
-        # Binary search for the best starting point in the first dimension
-        idx = bisect_left(right_first_vals, target_r0)
-        
-        # Check candidates to the right (>= target_r0)
-        for i in range(idx, len(right_sums)):
-            rs, rmask = right_sums[i]
-            diff0 = (ls[0] + rs[0]) - target[0]
-            # Pruning: if error in dim 0 alone exceeds best_err, stop this branch
-            if diff0 * diff0 >= best_err:
-                break
-            
-            s = [ls[d] + rs[d] for d in range(dim)]
-            err = squared_error(s, target)
-            if err < best_err:
-                best_err = err
-                best_sum = s
-                best_lmask = lmask
-                best_rmask = rmask
 
-        # Check candidates to the left (< target_r0)
-        for i in range(idx - 1, -1, -1):
-            rs, rmask = right_sums[i]
-            diff0 = (ls[0] + rs[0]) - target[0]
-            if diff0 * diff0 >= best_err:
-                break
-            
-            s = [ls[d] + rs[d] for d in range(dim)]
-            err = squared_error(s, target)
-            if err < best_err:
-                best_err = err
-                best_sum = s
-                best_lmask = lmask
-                best_rmask = rmask
+        if required_count is not None:
+            needed_rcount = required_count - lcount
+            if needed_rcount < 0 or needed_rcount > len(right_vals):
+                continue
+            rlist = right_by_count.get(needed_rcount, [])
+            if not rlist:
+                continue
+            rfirst = [x[0][0] for x in rlist]
+            pos = bisect_left(rfirst, target_r0)
+            for j in range(max(0, pos - window), min(len(rlist), pos + window + 1)):
+                rv, rmask = rlist[j]
+                s = [ls[d] + rv[d] for d in range(dim)]
+                err = squared_error(s, target)
+                candidates.append((err, lmask, rmask))
+        else:
+            pos = bisect_left(right_first_vals, target_r0)
+            for j in range(max(0, pos - window), min(len(right_sums_sorted), pos + window + 1)):
+                rv, rmask = right_sums_sorted[j]
+                s = [ls[d] + rv[d] for d in range(dim)]
+                err = squared_error(s, target)
+                candidates.append((err, lmask, rmask))
 
-    # Reconstruct indices
-    best_idxs: List[int] = []
-    i, m = 0, best_lmask
-    while i < len(left_vals):
-        if m & 1:
-            best_idxs.append(i)
-        i += 1; m >>= 1
-    i, m = 0, best_rmask
-    while i < len(right_vals):
-        if m & 1:
-            best_idxs.append(mid + i)
-        i += 1; m >>= 1
+    candidates.sort(key=lambda x: x[0])
 
-    return best_sum, best_idxs
+    results: List[Tuple[List[float], List[int]]] = []
+    seen: set = set()
+    for _, lmask, rmask in candidates:
+        key = (lmask, rmask)
+        if key in seen:
+            continue
+        seen.add(key)
+        idxs: List[int] = []
+        i, m = 0, lmask
+        while i < len(left_vals):
+            if m & 1:
+                idxs.append(i)
+            m >>= 1; i += 1
+        i, m = 0, rmask
+        while i < len(right_vals):
+            if m & 1:
+                idxs.append(mid + i)
+            m >>= 1; i += 1
+        s_vec = [sum(vals[idx][d] for idx in idxs) for d in range(dim)]
+        results.append((s_vec, sorted(idxs)))
+        if len(results) >= k:
+            break
+
+    return results
+
 
 # --------- Main solver ---------
-def solve_for_targets(source_a, source_b, use_last_only: bool = True):
+def solve_for_targets(
+    source_a,
+    source_b,
+    use_last_only: bool = True,
+    k_alternatives: int = 1,
+    required_count: Optional[int] = None,
+    best_per_count: bool = False,
+):
     if not source_b:
         raise ValueError("Source B is empty after parsing.")
 
@@ -295,6 +371,7 @@ def solve_for_targets(source_a, source_b, use_last_only: bool = True):
     if any(len(v) != dim for v in vals_b):
         raise ValueError("Inconsistent numeric column count across Source B rows.")
 
+    n_b = len(vals_b)
     lines: List[str] = []
 
     for a_name, a_vals in source_a:
@@ -303,21 +380,54 @@ def solve_for_targets(source_a, source_b, use_last_only: bool = True):
 
         lines.append(f"TARGET\t{a_name}\t" + "\t".join(f"{x:.6f}" for x in a_vals))
 
-        if dim == 1:  # scalar mode
-            best_sum, idxs = meet_in_the_middle_best(a_vals[0], [v[0] for v in vals_b])
-            diff = best_sum - a_vals[0]
-            lines.append(f"BEST_TOTAL\t{best_sum:.6f}\tDIFF\t{diff:.6f}")
-            lines.append(f"COUNT\t{len(idxs)}")
-            for i in idxs:
-                lines.append(f"{names_b[i]}\t{vals_b[i][0]:.6f}")
-        else:  # vector mode
-            best_sum, idxs = meet_in_the_middle_best_vec(a_vals, vals_b)
-            diffs = [best_sum[d] - a_vals[d] for d in range(dim)]
-            lines.append("BEST_TOTAL\t\t" + "\t".join(f"{x:.6f}" for x in best_sum))
-            lines.append("DIFF\t\t" + "\t".join(f"{x:.6f}" for x in diffs))
-            lines.append(f"COUNT\t\t{len(idxs)}")
-            for i in idxs:
-                lines.append(f"{names_b[i]}\t\t" + "\t".join(f"{x:.6f}" for x in vals_b[i]))
+        # Determine which counts to iterate over
+        if best_per_count:
+            max_cnt = required_count if required_count is not None else n_b
+            count_range = list(range(max_cnt, 0, -1))
+        elif required_count is not None:
+            count_range = [required_count]
+        else:
+            count_range = [None]  # unconstrained
+
+        for cnt in count_range:
+            if best_per_count:
+                lines.append(f"  COUNT {cnt}")
+
+            if dim == 1:
+                matches = meet_in_the_middle_top_k(
+                    a_vals[0], [v[0] for v in vals_b],
+                    k=k_alternatives, required_count=cnt,
+                )
+            else:
+                matches = meet_in_the_middle_top_k_vec(
+                    a_vals, vals_b,
+                    k=k_alternatives, required_count=cnt,
+                )
+
+            if not matches:
+                lines.append("  (no valid subset)")
+                continue
+
+            for match_idx, match in enumerate(matches, 1):
+                if k_alternatives > 1:
+                    lines.append(f"  MATCH {match_idx}")
+
+                if dim == 1:
+                    best_sum, idxs = match
+                    diff = best_sum - a_vals[0]
+                    lines.append(f"BEST_TOTAL\t{best_sum:.6f}\tDIFF\t{diff:.6f}")
+                    lines.append(f"COUNT\t{len(idxs)}")
+                    for i in idxs:
+                        lines.append(f"{names_b[i]}\t{vals_b[i][0]:.6f}")
+                else:
+                    best_sum, idxs = match
+                    diffs = [best_sum[d] - a_vals[d] for d in range(dim)]
+                    lines.append("BEST_TOTAL\t\t" + "\t".join(f"{x:.6f}" for x in best_sum))
+                    lines.append("DIFF\t\t" + "\t".join(f"{x:.6f}" for x in diffs))
+                    lines.append(f"COUNT\t\t{len(idxs)}")
+                    for i in idxs:
+                        lines.append(f"{names_b[i]}\t\t" + "\t".join(f"{x:.6f}" for x in vals_b[i]))
+
         lines.append("")
 
     output_tsv = "\n".join(lines).rstrip("\n")
@@ -331,6 +441,17 @@ def main():
         print("Use only the last column as value? (y/n) [y]: ", end="")
         use_last_only = (input().strip().lower() or "y").startswith("y")
 
+        print("Best option per count (show best match for each subset size, highest to lowest)? (y/n) [n]: ", end="")
+        best_per_count = (input().strip().lower() or "n").startswith("y")
+
+        print("Number of alternatives [1]: ", end="")
+        raw = input().strip()
+        k_alternatives = int(raw) if raw.isdigit() and int(raw) >= 1 else 1
+
+        print("Mandatory number of rows per match (0 = any) [0]: ", end="")
+        raw = input().strip()
+        required_count: Optional[int] = int(raw) if raw.isdigit() and int(raw) >= 1 else None
+
         source_a = parse_pasted_block("Copy Source A (target values) now, then press Enter.", "Source A Item", use_last_only)
         if not source_a:
             print("No Source A (target values) data provided. Exiting.")
@@ -341,11 +462,15 @@ def main():
             print("No Source B (accounts to loop through) data provided. Exiting.")
             return
 
-        solve_for_targets(source_a, source_b, use_last_only=use_last_only)
+        solve_for_targets(
+            source_a, source_b, use_last_only,
+            k_alternatives=k_alternatives,
+            required_count=required_count,
+            best_per_count=best_per_count,
+        )
         print("Results copied to clipboard.")
 
     except Exception as e:
-        # Print a clear error to stderr so you see *why* it “stops”
         print(f"\n[ERROR] {e}", file=sys.stderr)
 
 if __name__ == "__main__":
