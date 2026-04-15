@@ -1,27 +1,36 @@
 # !/usr/bin/env python3
-import win32clipboard
 import re
+import time
+import threading
+import queue
 from bisect import bisect_left
-from typing import List, Tuple
+from collections import defaultdict
+from typing import Dict, List, Optional, Tuple
 import sys
+
+try:
+    import win32clipboard as _win32cb
+    _HAS_WIN32CB = True
+except ImportError:
+    _HAS_WIN32CB = False
 
 # --------- Regex for numbers ---------
 NUM_RE = re.compile(r"""
     ^\s*
-    (?P<open_par>\()?        
+    (?P<open_par>\()?
     \s*
-    (?P<sign>-)?             
+    (?P<sign>-)?
     \s*
-    [\$€£]*                  
+    [\$€£]*
     \s*
     (?:S/\.)?
     \s*
-    (?P<int>\d{1,3}(?:[.,]\d{3})*|\d+) 
-    (?P<dec>[.,]\d+)?        
+    (?P<int>\d{1,3}(?:[.,]\d{3})*|\d+)
+    (?P<dec>[.,]\d+)?
     \s*
-    %?                       
+    %?
     \s*
-    \)?                      
+    \)?
     \s*$
 """, re.VERBOSE)
 
@@ -33,7 +42,7 @@ TRAILING_NUM_RE = re.compile(r"""
         [\$€£]*\s*
         (?:S/\.)?\s*
         (?P<int>\d{1,3}(?:[.,]\d{3})*|\d+)
-        (?P<dec>[.,]\d+)? 
+        (?P<dec>[.,]\d+)?
         \s*%?\s*
         \)?\s*
     )$
@@ -41,20 +50,24 @@ TRAILING_NUM_RE = re.compile(r"""
 
 # --------- Clipboard ---------
 def read_clipboard_text() -> str:
-    win32clipboard.OpenClipboard()
+    if not _HAS_WIN32CB:
+        raise RuntimeError("win32clipboard not available")
+    _win32cb.OpenClipboard()
     try:
-        data = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
+        data = _win32cb.GetClipboardData(_win32cb.CF_UNICODETEXT)
     finally:
-        win32clipboard.CloseClipboard()
+        _win32cb.CloseClipboard()
     return data
 
 def write_clipboard_text(text: str) -> None:
-    win32clipboard.OpenClipboard()
+    if not _HAS_WIN32CB:
+        raise RuntimeError("win32clipboard not available")
+    _win32cb.OpenClipboard()
     try:
-        win32clipboard.EmptyClipboard()
-        win32clipboard.SetClipboardText(text)
+        _win32cb.EmptyClipboard()
+        _win32cb.SetClipboardText(text)
     finally:
-        win32clipboard.CloseClipboard()
+        _win32cb.CloseClipboard()
 
 # --------- Number parsing ---------
 def parse_number(text: str) -> float:
@@ -77,14 +90,13 @@ def parse_number(text: str) -> float:
     return val
 
 # --------- Parsing ---------
-def parse_pasted_block(prompt: str, default_prefix: str, use_last_only: bool = True) -> List[Tuple[str, List[float]]]:
+def parse_text_block(text: str, default_prefix: str, use_last_only: bool = True) -> List[Tuple[str, List[float]]]:
     """
+    Parse a tab-separated text block into (name, values) rows.
     - If use_last_only=True → only last column is taken as scalar value (wrapped in list).
     - If use_last_only=False → all numeric columns except first are taken as a vector.
     Treats '-' as 0.0 in any numeric column.
     """
-    input(prompt)
-    text = read_clipboard_text()
     lines = [ln.rstrip("\r").strip() for ln in text.split("\n") if ln.strip()]
     rows: List[Tuple[str, List[float]]] = []
     idx = 1
@@ -105,7 +117,6 @@ def parse_pasted_block(prompt: str, default_prefix: str, use_last_only: bool = T
                 except Exception:
                     cols = [0.0]
         else:
-            # All columns after the first name column are numeric features
             cols: List[float] = []
             for p in parts[1:]:
                 pp = p.strip()
@@ -115,9 +126,7 @@ def parse_pasted_block(prompt: str, default_prefix: str, use_last_only: bool = T
                 try:
                     cols.append(parse_number(pp))
                 except Exception:
-                    # Be forgiving: treat unparseable numeric columns as 0.0
                     cols.append(0.0)
-            # If there were no extra columns, keep at least a scalar 0.0 to avoid dimension errors
             if not cols:
                 cols = [0.0]
 
@@ -125,6 +134,13 @@ def parse_pasted_block(prompt: str, default_prefix: str, use_last_only: bool = T
         idx += 1
 
     return rows
+
+
+def parse_pasted_block(prompt: str, default_prefix: str, use_last_only: bool = True) -> List[Tuple[str, List[float]]]:
+    """CLI version: prompts the user to copy data, then reads from clipboard."""
+    input(prompt)
+    text = read_clipboard_text()
+    return parse_text_block(text, default_prefix, use_last_only)
 
 # --------- Formatting ---------
 def format_money(x: float) -> str:
@@ -146,48 +162,97 @@ def all_subset_sums(values: List[float]) -> List[Tuple[float, int]]:
         out.append((s, mask))
     return out
 
-def meet_in_the_middle_best(target: float, vals: List[float]) -> Tuple[float, List[int]]:
+
+def meet_in_the_middle_top_k(
+    target: float,
+    vals: List[float],
+    k: int = 1,
+    required_count: Optional[int] = None,
+) -> List[Tuple[float, List[int]]]:
+    """
+    Returns up to k best (total, sorted_indices) subsets ordered by |total - target|.
+    If required_count is given, only subsets of exactly that size are considered.
+    Uses a window search around the binary-search position; window = max(k*10, 50).
+    """
     n = len(vals)
     mid = n // 2
     left_vals = vals[:mid]
     right_vals = vals[mid:]
-    left_sums = all_subset_sums(left_vals)
+
+    left_sums = all_subset_sums(left_vals)   # includes empty subset (0.0, 0)
     right_sums = all_subset_sums(right_vals)
-    right_sums.sort(key=lambda x: x[0])
-    right_only = [s for s, _ in right_sums]
-    best_err = float("inf")
-    best_total = 0.0
-    best_left_mask = 0
-    best_right_mask = 0
+
+    # Group right sums by popcount for fast required_count lookup
+    right_by_count: Dict[int, List[Tuple[float, int]]] = defaultdict(list)
+    for rs, rmask in right_sums:
+        right_by_count[bin(rmask).count('1')].append((rs, rmask))
+    for c in right_by_count:
+        right_by_count[c].sort()
+
+    # Sorted all right sums (for unconstrained case)
+    right_sums_sorted = sorted(right_sums, key=lambda x: x[0])
+    right_only = [s for s, _ in right_sums_sorted]
+
+    window = max(k * 10, 50)
+    candidates: List[Tuple[float, float, int, int]] = []  # (err, abs_total, lmask, rmask)
+
     for ls, lmask in left_sums:
+        lcount = bin(lmask).count('1')
         need = target - ls
-        pos = bisect_left(right_only, need)
-        for j in (pos-1, pos, pos+1):
-            if 0 <= j < len(right_sums):
-                rs, rmask = right_sums[j]
+
+        if required_count is not None:
+            needed_rcount = required_count - lcount
+            if needed_rcount < 0 or needed_rcount > len(right_vals):
+                continue
+            rlist = right_by_count.get(needed_rcount, [])
+            if not rlist:
+                continue
+            rvals = [s for s, _ in rlist]
+            pos = bisect_left(rvals, need)
+            for j in range(max(0, pos - window), min(len(rlist), pos + window + 1)):
+                rs, rmask = rlist[j]
                 total = ls + rs
-                err = abs(total - target)
-                if err < best_err or (err == best_err and abs(total) < abs(best_total)):
-                    best_err = err
-                    best_total = total
-                    best_left_mask = lmask
-                    best_right_mask = rmask
-    chosen_indices: List[int] = []
-    i, m = 0, best_left_mask
-    while i < len(left_vals):
-        if m & 1:
-            chosen_indices.append(i)
-        m >>= 1; i += 1
-    i, m = 0, best_right_mask
-    while i < len(right_vals):
-        if m & 1:
-            chosen_indices.append(mid + i)
-        m >>= 1; i += 1
-    return best_total, sorted(chosen_indices)
+                candidates.append((abs(total - target), abs(total), lmask, rmask))
+        else:
+            pos = bisect_left(right_only, need)
+            for j in range(max(0, pos - window), min(len(right_sums_sorted), pos + window + 1)):
+                rs, rmask = right_sums_sorted[j]
+                total = ls + rs
+                candidates.append((abs(total - target), abs(total), lmask, rmask))
+
+    candidates.sort()
+
+    results: List[Tuple[float, List[int]]] = []
+    seen: set = set()
+    for _, _, lmask, rmask in candidates:
+        key = (lmask, rmask)
+        if key in seen:
+            continue
+        seen.add(key)
+        idxs: List[int] = []
+        i, m = 0, lmask
+        while i < len(left_vals):
+            if m & 1:
+                idxs.append(i)
+            m >>= 1; i += 1
+        i, m = 0, rmask
+        while i < len(right_vals):
+            if m & 1:
+                idxs.append(mid + i)
+            m >>= 1; i += 1
+        total = sum(vals[idx] for idx in idxs)
+        results.append((total, sorted(idxs)))
+        if len(results) >= k:
+            break
+
+    return results
+
 
 # --------- Vector MITM ---------
 def all_subset_sums_vec(values: List[List[float]]) -> List[Tuple[List[float], int]]:
     n = len(values)
+    if n == 0:
+        return []
     dim = len(values[0])
     out: List[Tuple[List[float], int]] = []
     for mask in range(1 << n):
@@ -207,80 +272,107 @@ def all_subset_sums_vec(values: List[List[float]]) -> List[Tuple[List[float], in
 def squared_error(vec1: List[float], vec2: List[float]) -> float:
     return sum((a - b) ** 2 for a, b in zip(vec1, vec2))
 
-def meet_in_the_middle_best_vec(target: List[float], vals: List[List[float]]) -> Tuple[List[float], List[int]]:
+
+def meet_in_the_middle_top_k_vec(
+    target: List[float],
+    vals: List[List[float]],
+    k: int = 1,
+    required_count: Optional[int] = None,
+) -> List[Tuple[List[float], List[int]]]:
+    """
+    Returns up to k best (sum_vec, sorted_indices) ordered by squared error from target.
+    If required_count is given, only subsets of exactly that size are considered.
+    """
     n = len(vals)
     dim = len(target)
     mid = n // 2
     left_vals = vals[:mid]
     right_vals = vals[mid:]
 
-    left_sums = all_subset_sums_vec(left_vals)
+    # Handle empty left half (when n == 1)
+    left_sums: List[Tuple[List[float], int]] = (
+        all_subset_sums_vec(left_vals) if left_vals else [([0.0] * dim, 0)]
+    )
     right_sums = all_subset_sums_vec(right_vals)
 
-    # Optimization: Sort right_sums by the first dimension to allow pruning
-    right_sums.sort(key=lambda x: x[0][0])
-    right_first_vals = [x[0][0] for x in right_sums]
+    # Group right sums by popcount
+    right_by_count: Dict[int, List[Tuple[List[float], int]]] = defaultdict(list)
+    for rv, rmask in right_sums:
+        right_by_count[bin(rmask).count('1')].append((rv, rmask))
+    for c in right_by_count:
+        right_by_count[c].sort(key=lambda x: x[0][0])
 
-    best_err = float("inf")
-    best_sum = [0.0] * dim
-    best_lmask = 0
-    best_rmask = 0
+    # Sorted all right sums by first dimension (for unconstrained case)
+    right_sums_sorted = sorted(right_sums, key=lambda x: x[0][0])
+    right_first_vals = [x[0][0] for x in right_sums_sorted]
+
+    window = max(k * 10, 50)
+    candidates: List[Tuple[float, int, int]] = []  # (err, lmask, rmask)
 
     for ls, lmask in left_sums:
-        # We need: ls[0] + rs[0] ≈ target[0]  =>  rs[0] ≈ target[0] - ls[0]
+        lcount = bin(lmask).count('1')
         target_r0 = target[0] - ls[0]
-        
-        # Binary search for the best starting point in the first dimension
-        idx = bisect_left(right_first_vals, target_r0)
-        
-        # Check candidates to the right (>= target_r0)
-        for i in range(idx, len(right_sums)):
-            rs, rmask = right_sums[i]
-            diff0 = (ls[0] + rs[0]) - target[0]
-            # Pruning: if error in dim 0 alone exceeds best_err, stop this branch
-            if diff0 * diff0 >= best_err:
-                break
-            
-            s = [ls[d] + rs[d] for d in range(dim)]
-            err = squared_error(s, target)
-            if err < best_err:
-                best_err = err
-                best_sum = s
-                best_lmask = lmask
-                best_rmask = rmask
 
-        # Check candidates to the left (< target_r0)
-        for i in range(idx - 1, -1, -1):
-            rs, rmask = right_sums[i]
-            diff0 = (ls[0] + rs[0]) - target[0]
-            if diff0 * diff0 >= best_err:
-                break
-            
-            s = [ls[d] + rs[d] for d in range(dim)]
-            err = squared_error(s, target)
-            if err < best_err:
-                best_err = err
-                best_sum = s
-                best_lmask = lmask
-                best_rmask = rmask
+        if required_count is not None:
+            needed_rcount = required_count - lcount
+            if needed_rcount < 0 or needed_rcount > len(right_vals):
+                continue
+            rlist = right_by_count.get(needed_rcount, [])
+            if not rlist:
+                continue
+            rfirst = [x[0][0] for x in rlist]
+            pos = bisect_left(rfirst, target_r0)
+            for j in range(max(0, pos - window), min(len(rlist), pos + window + 1)):
+                rv, rmask = rlist[j]
+                s = [ls[d] + rv[d] for d in range(dim)]
+                err = squared_error(s, target)
+                candidates.append((err, lmask, rmask))
+        else:
+            pos = bisect_left(right_first_vals, target_r0)
+            for j in range(max(0, pos - window), min(len(right_sums_sorted), pos + window + 1)):
+                rv, rmask = right_sums_sorted[j]
+                s = [ls[d] + rv[d] for d in range(dim)]
+                err = squared_error(s, target)
+                candidates.append((err, lmask, rmask))
 
-    # Reconstruct indices
-    best_idxs: List[int] = []
-    i, m = 0, best_lmask
-    while i < len(left_vals):
-        if m & 1:
-            best_idxs.append(i)
-        i += 1; m >>= 1
-    i, m = 0, best_rmask
-    while i < len(right_vals):
-        if m & 1:
-            best_idxs.append(mid + i)
-        i += 1; m >>= 1
+    candidates.sort(key=lambda x: x[0])
 
-    return best_sum, best_idxs
+    results: List[Tuple[List[float], List[int]]] = []
+    seen: set = set()
+    for _, lmask, rmask in candidates:
+        key = (lmask, rmask)
+        if key in seen:
+            continue
+        seen.add(key)
+        idxs: List[int] = []
+        i, m = 0, lmask
+        while i < len(left_vals):
+            if m & 1:
+                idxs.append(i)
+            m >>= 1; i += 1
+        i, m = 0, rmask
+        while i < len(right_vals):
+            if m & 1:
+                idxs.append(mid + i)
+            m >>= 1; i += 1
+        s_vec = [sum(vals[idx][d] for idx in idxs) for d in range(dim)]
+        results.append((s_vec, sorted(idxs)))
+        if len(results) >= k:
+            break
+
+    return results
+
 
 # --------- Main solver ---------
-def solve_for_targets(source_a, source_b, use_last_only: bool = True):
+def solve_for_targets(
+    source_a,
+    source_b,
+    use_last_only: bool = True,
+    k_alternatives: int = 1,
+    required_count: Optional[int] = None,
+    best_per_count: bool = False,
+) -> str:
+    """Run the matching and return the result as a TSV string."""
     if not source_b:
         raise ValueError("Source B is empty after parsing.")
 
@@ -295,6 +387,7 @@ def solve_for_targets(source_a, source_b, use_last_only: bool = True):
     if any(len(v) != dim for v in vals_b):
         raise ValueError("Inconsistent numeric column count across Source B rows.")
 
+    n_b = len(vals_b)
     lines: List[str] = []
 
     for a_name, a_vals in source_a:
@@ -303,50 +396,300 @@ def solve_for_targets(source_a, source_b, use_last_only: bool = True):
 
         lines.append(f"TARGET\t{a_name}\t" + "\t".join(f"{x:.6f}" for x in a_vals))
 
-        if dim == 1:  # scalar mode
-            best_sum, idxs = meet_in_the_middle_best(a_vals[0], [v[0] for v in vals_b])
-            diff = best_sum - a_vals[0]
-            lines.append(f"BEST_TOTAL\t{best_sum:.6f}\tDIFF\t{diff:.6f}")
-            lines.append(f"COUNT\t{len(idxs)}")
-            for i in idxs:
-                lines.append(f"{names_b[i]}\t{vals_b[i][0]:.6f}")
-        else:  # vector mode
-            best_sum, idxs = meet_in_the_middle_best_vec(a_vals, vals_b)
-            diffs = [best_sum[d] - a_vals[d] for d in range(dim)]
-            lines.append("BEST_TOTAL\t\t" + "\t".join(f"{x:.6f}" for x in best_sum))
-            lines.append("DIFF\t\t" + "\t".join(f"{x:.6f}" for x in diffs))
-            lines.append(f"COUNT\t\t{len(idxs)}")
-            for i in idxs:
-                lines.append(f"{names_b[i]}\t\t" + "\t".join(f"{x:.6f}" for x in vals_b[i]))
+        # Determine which counts to iterate over
+        if best_per_count:
+            max_cnt = required_count if required_count is not None else n_b
+            count_range = list(range(max_cnt, 0, -1))
+        elif required_count is not None:
+            count_range = [required_count]
+        else:
+            count_range = [None]  # unconstrained
+
+        for cnt in count_range:
+            if best_per_count:
+                lines.append(f"  COUNT {cnt}")
+
+            if dim == 1:
+                matches = meet_in_the_middle_top_k(
+                    a_vals[0], [v[0] for v in vals_b],
+                    k=k_alternatives, required_count=cnt,
+                )
+            else:
+                matches = meet_in_the_middle_top_k_vec(
+                    a_vals, vals_b,
+                    k=k_alternatives, required_count=cnt,
+                )
+
+            if not matches:
+                lines.append("  (no valid subset)")
+                continue
+
+            for match_idx, match in enumerate(matches, 1):
+                if k_alternatives > 1:
+                    lines.append(f"  MATCH {match_idx}")
+
+                if dim == 1:
+                    best_sum, idxs = match
+                    used = set(idxs)
+                    diff = best_sum - a_vals[0]
+                    idx_set = set(idxs)
+                    lines.append(f"BEST_TOTAL\t{best_sum:.6f}\tDIFF\t{diff:.6f}")
+                    lines.append(f"COUNT\t{len(idxs)}")
+                    for i, (nb, vb) in enumerate(zip(names_b, vals_b)):
+                        flag = 1 if i in idx_set else 0
+                        lines.append(f"{nb}\t{vb[0]:.6f}\t{flag}")
+                else:
+                    best_sum, idxs = match
+                    used = set(idxs)
+                    diffs = [best_sum[d] - a_vals[d] for d in range(dim)]
+                    idx_set = set(idxs)
+                    lines.append("BEST_TOTAL\t\t" + "\t".join(f"{x:.6f}" for x in best_sum))
+                    lines.append("DIFF\t\t" + "\t".join(f"{x:.6f}" for x in diffs))
+                    lines.append(f"COUNT\t\t{len(idxs)}")
+                    for i, (nb, vb) in enumerate(zip(names_b, vals_b)):
+                        flag = 1 if i in idx_set else 0
+                        lines.append(f"{nb}\t\t" + "\t".join(f"{x:.6f}" for x in vb) + f"\t{flag}")
+
         lines.append("")
 
-    output_tsv = "\n".join(lines).rstrip("\n")
-    input("Results ready. Press Enter to copy to clipboard...")
-    write_clipboard_text(output_tsv)
+    return "\n".join(lines).rstrip("\n")
+
+
+# --------- GUI ---------
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox, scrolledtext
+    _HAS_TK = True
+except ImportError:
+    _HAS_TK = False
+
+
+class AccountMatcherApp:
+    def __init__(self, root: "tk.Tk"):
+        self.root = root
+        self.root.title("Account Matcher")
+        self.root.resizable(True, True)
+        self.root.geometry("960x680")
+        self._build_ui()
+
+    def _build_ui(self):
+        # ---- Options frame ----
+        opt_frame = ttk.LabelFrame(self.root, text="Options", padding=8)
+        opt_frame.pack(fill="x", padx=10, pady=(10, 4))
+
+        self.var_last_only = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            opt_frame,
+            text="Use only last column as value  (scalar mode)",
+            variable=self.var_last_only,
+        ).grid(row=0, column=0, sticky="w", padx=(0, 30), pady=2)
+
+        self.var_best_per_count = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            opt_frame,
+            text="Show best match per subset count",
+            variable=self.var_best_per_count,
+        ).grid(row=0, column=1, sticky="w", pady=2)
+
+        alt_sub = ttk.Frame(opt_frame)
+        alt_sub.grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Label(alt_sub, text="Number of alternatives:").pack(side="left")
+        self.var_k_alt = tk.StringVar(value="1")
+        ttk.Spinbox(alt_sub, from_=1, to=999, textvariable=self.var_k_alt, width=5).pack(side="left", padx=(6, 0))
+
+        req_sub = ttk.Frame(opt_frame)
+        req_sub.grid(row=1, column=1, sticky="w", pady=2)
+        ttk.Label(req_sub, text="Mandatory rows per match  (0 = any):").pack(side="left")
+        self.var_req_count = tk.StringVar(value="0")
+        ttk.Spinbox(req_sub, from_=0, to=999, textvariable=self.var_req_count, width=5).pack(side="left", padx=(6, 0))
+
+        # ---- Data frame (Source A | Source B side by side) ----
+        data_frame = ttk.Frame(self.root)
+        data_frame.pack(fill="both", expand=True, padx=10, pady=4)
+        data_frame.columnconfigure(0, weight=1)
+        data_frame.columnconfigure(1, weight=1)
+        data_frame.rowconfigure(1, weight=1)
+
+        ttk.Label(data_frame, text="Source A  —  target values  (paste tab-separated data):").grid(
+            row=0, column=0, sticky="w", pady=(0, 2))
+        self.text_a = scrolledtext.ScrolledText(
+            data_frame, height=18, wrap=tk.NONE, font=("Courier New", 9))
+        self.text_a.grid(row=1, column=0, sticky="nsew", padx=(0, 4))
+
+        ttk.Label(data_frame, text="Source B  —  accounts  (paste tab-separated data):").grid(
+            row=0, column=1, sticky="w", pady=(0, 2))
+        self.text_b = scrolledtext.ScrolledText(
+            data_frame, height=18, wrap=tk.NONE, font=("Courier New", 9))
+        self.text_b.grid(row=1, column=1, sticky="nsew", padx=(4, 0))
+
+        # ---- Button bar ----
+        btn_frame = ttk.Frame(self.root)
+        btn_frame.pack(fill="x", padx=10, pady=(4, 10))
+        self.btn_run = ttk.Button(btn_frame, text="Run Matching", command=self._run)
+        self.btn_run.pack(side="right", padx=4)
+        ttk.Button(btn_frame, text="Clear All", command=self._clear).pack(side="right", padx=4)
+        self._status_var = tk.StringVar(value="")
+        ttk.Label(btn_frame, textvariable=self._status_var, foreground="gray").pack(side="right", padx=12)
+
+    # ------------------------------------------------------------------
+    def _clear(self):
+        self.text_a.delete("1.0", tk.END)
+        self.text_b.delete("1.0", tk.END)
+
+    def _run(self):
+        use_last_only = self.var_last_only.get()
+        best_per_count = self.var_best_per_count.get()
+        try:
+            k_alternatives = max(1, int(self.var_k_alt.get()))
+        except ValueError:
+            k_alternatives = 1
+        try:
+            req = int(self.var_req_count.get())
+            required_count: Optional[int] = req if req >= 1 else None
+        except ValueError:
+            required_count = None
+
+        text_a = self.text_a.get("1.0", tk.END).strip()
+        text_b = self.text_b.get("1.0", tk.END).strip()
+
+        if not text_a:
+            messagebox.showwarning("Missing Data", "Source A is empty. Please paste your target values.")
+            return
+        if not text_b:
+            messagebox.showwarning("Missing Data", "Source B is empty. Please paste your account data.")
+            return
+
+        try:
+            source_a = parse_text_block(text_a, "Source A Item", use_last_only)
+            source_b = parse_text_block(text_b, "Source B Item", use_last_only)
+        except Exception as e:
+            messagebox.showerror("Parse Error", str(e))
+            return
+
+        if not source_a:
+            messagebox.showwarning("No Data", "No rows were found in Source A.")
+            return
+        if not source_b:
+            messagebox.showwarning("No Data", "No rows were found in Source B.")
+            return
+
+        # Disable button and show status while the algorithm runs in background
+        self.btn_run.config(state="disabled")
+        self._status_var.set("Running...")
+        start_ts = time.perf_counter()
+
+        result_q: "queue.Queue[tuple]" = queue.Queue()
+
+        def _worker():
+            try:
+                tsv = solve_for_targets(
+                    source_a, source_b, use_last_only,
+                    k_alternatives=k_alternatives,
+                    required_count=required_count,
+                    best_per_count=best_per_count,
+                )
+                result_q.put(("ok", tsv))
+            except Exception as exc:
+                result_q.put(("err", str(exc)))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+        def _poll():
+            try:
+                status, data = result_q.get_nowait()
+            except queue.Empty:
+                self.root.after(100, _poll)
+                return
+            elapsed = time.perf_counter() - start_ts
+            self.btn_run.config(state="normal")
+            self._status_var.set(f"Done in {elapsed:.2f}s")
+            if status == "ok":
+                self._show_results(data, elapsed)
+            else:
+                messagebox.showerror("Matching Error", data)
+
+        self.root.after(100, _poll)
+
+    def _show_results(self, tsv: str, elapsed: float):
+        win = tk.Toplevel(self.root)
+        win.title(f"Results  ({elapsed:.2f}s)")
+        win.geometry("820x520")
+        win.resizable(True, True)
+
+        header = f"# Computed in {elapsed:.3f} seconds\n\n"
+        full_text = header + tsv
+
+        txt = scrolledtext.ScrolledText(win, wrap=tk.NONE, font=("Courier New", 9))
+        txt.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+        txt.insert("1.0", full_text)
+        txt.config(state="disabled")
+
+        def _copy():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(tsv)   # copy TSV only, without the comment header
+            messagebox.showinfo("Copied", "Results copied to clipboard.", parent=win)
+
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(bar, text="Copy to Clipboard", command=_copy).pack(side="right", padx=4)
+        ttk.Button(bar, text="Close", command=win.destroy).pack(side="right", padx=4)
+
 
 # --------- Main ---------
 def main():
+    if _HAS_TK:
+        root = tk.Tk()
+        AccountMatcherApp(root)
+        root.mainloop()
+    else:
+        _main_cli()
+
+
+def _main_cli():
+    """Fallback CLI mode (used when tkinter is unavailable)."""
     try:
         print("\n=== Tie Accounts Across Sources (Scalar or Vector Mode) ===\n")
         print("Use only the last column as value? (y/n) [y]: ", end="")
         use_last_only = (input().strip().lower() or "y").startswith("y")
 
-        source_a = parse_pasted_block("Copy Source A (target values) now, then press Enter.", "Source A Item", use_last_only)
+        print("Best option per count (show best match for each subset size, highest to lowest)? (y/n) [n]: ", end="")
+        best_per_count = (input().strip().lower() or "n").startswith("y")
+
+        print("Number of alternatives [1]: ", end="")
+        raw = input().strip()
+        k_alternatives = int(raw) if raw.isdigit() and int(raw) >= 1 else 1
+
+        print("Mandatory number of rows per match (0 = any) [0]: ", end="")
+        raw = input().strip()
+        required_count: Optional[int] = int(raw) if raw.isdigit() and int(raw) >= 1 else None
+
+        source_a = parse_pasted_block(
+            "Copy Source A (target values) now, then press Enter.", "Source A Item", use_last_only)
         if not source_a:
             print("No Source A (target values) data provided. Exiting.")
             return
 
-        source_b = parse_pasted_block("Copy Source B (accounts to loop through) now, then press Enter.", "Source B Item", use_last_only)
+        source_b = parse_pasted_block(
+            "Copy Source B (accounts to loop through) now, then press Enter.", "Source B Item", use_last_only)
         if not source_b:
             print("No Source B (accounts to loop through) data provided. Exiting.")
             return
+        t_start = time.time()
 
-        solve_for_targets(source_a, source_b, use_last_only=use_last_only)
+        result_tsv = solve_for_targets(
+            source_a, source_b, use_last_only,
+            k_alternatives=k_alternatives,
+            required_count=required_count,
+            best_per_count=best_per_count,
+            t_start=t_start,
+        )
+        input("Results ready. Press Enter to copy to clipboard...")
+        write_clipboard_text(result_tsv)
         print("Results copied to clipboard.")
 
     except Exception as e:
-        # Print a clear error to stderr so you see *why* it “stops”
         print(f"\n[ERROR] {e}", file=sys.stderr)
+
 
 if __name__ == "__main__":
     try:
