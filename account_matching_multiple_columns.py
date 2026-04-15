@@ -1,6 +1,7 @@
 # !/usr/bin/env python3
 import win32clipboard
 import re
+import time
 from bisect import bisect_left
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
@@ -356,6 +357,7 @@ def solve_for_targets(
     k_alternatives: int = 1,
     required_count: Optional[int] = None,
     best_per_count: bool = False,
+    t_start: Optional[float] = None,
 ):
     if not source_b:
         raise ValueError("Source B is empty after parsing.")
@@ -414,23 +416,30 @@ def solve_for_targets(
 
                 if dim == 1:
                     best_sum, idxs = match
+                    used = set(idxs)
                     diff = best_sum - a_vals[0]
                     lines.append(f"BEST_TOTAL\t{best_sum:.6f}\tDIFF\t{diff:.6f}")
                     lines.append(f"COUNT\t{len(idxs)}")
-                    for i in idxs:
-                        lines.append(f"{names_b[i]}\t{vals_b[i][0]:.6f}")
+                    for i in range(n_b):
+                        flag = 1 if i in used else 0
+                        lines.append(f"{names_b[i]}\t{vals_b[i][0]:.6f}\t{flag}")
                 else:
                     best_sum, idxs = match
+                    used = set(idxs)
                     diffs = [best_sum[d] - a_vals[d] for d in range(dim)]
                     lines.append("BEST_TOTAL\t\t" + "\t".join(f"{x:.6f}" for x in best_sum))
                     lines.append("DIFF\t\t" + "\t".join(f"{x:.6f}" for x in diffs))
                     lines.append(f"COUNT\t\t{len(idxs)}")
-                    for i in idxs:
-                        lines.append(f"{names_b[i]}\t\t" + "\t".join(f"{x:.6f}" for x in vals_b[i]))
+                    for i in range(n_b):
+                        flag = 1 if i in used else 0
+                        lines.append(f"{names_b[i]}\t\t" + "\t".join(f"{x:.6f}" for x in vals_b[i]) + f"\t{flag}")
 
         lines.append("")
 
     output_tsv = "\n".join(lines).rstrip("\n")
+    if t_start is not None:
+        elapsed = time.time() - t_start
+        print(f"Computation time: {elapsed:.3f}s")
     input("Results ready. Press Enter to copy to clipboard...")
     write_clipboard_text(output_tsv)
 
@@ -461,12 +470,14 @@ def main():
         if not source_b:
             print("No Source B (accounts to loop through) data provided. Exiting.")
             return
+        t_start = time.time()
 
         solve_for_targets(
             source_a, source_b, use_last_only,
             k_alternatives=k_alternatives,
             required_count=required_count,
             best_per_count=best_per_count,
+            t_start=t_start,
         )
         print("Results copied to clipboard.")
 
