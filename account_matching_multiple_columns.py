@@ -1,5 +1,8 @@
 # !/usr/bin/env python3
 import re
+import time
+import threading
+import queue
 from bisect import bisect_left
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
@@ -428,18 +431,22 @@ def solve_for_targets(
                 if dim == 1:
                     best_sum, idxs = match
                     diff = best_sum - a_vals[0]
+                    idx_set = set(idxs)
                     lines.append(f"BEST_TOTAL\t{best_sum:.6f}\tDIFF\t{diff:.6f}")
                     lines.append(f"COUNT\t{len(idxs)}")
-                    for i in idxs:
-                        lines.append(f"{names_b[i]}\t{vals_b[i][0]:.6f}")
+                    for i, (nb, vb) in enumerate(zip(names_b, vals_b)):
+                        flag = 1 if i in idx_set else 0
+                        lines.append(f"{nb}\t{vb[0]:.6f}\t{flag}")
                 else:
                     best_sum, idxs = match
                     diffs = [best_sum[d] - a_vals[d] for d in range(dim)]
+                    idx_set = set(idxs)
                     lines.append("BEST_TOTAL\t\t" + "\t".join(f"{x:.6f}" for x in best_sum))
                     lines.append("DIFF\t\t" + "\t".join(f"{x:.6f}" for x in diffs))
                     lines.append(f"COUNT\t\t{len(idxs)}")
-                    for i in idxs:
-                        lines.append(f"{names_b[i]}\t\t" + "\t".join(f"{x:.6f}" for x in vals_b[i]))
+                    for i, (nb, vb) in enumerate(zip(names_b, vals_b)):
+                        flag = 1 if i in idx_set else 0
+                        lines.append(f"{nb}\t\t" + "\t".join(f"{x:.6f}" for x in vb) + f"\t{flag}")
 
         lines.append("")
 
@@ -516,8 +523,11 @@ class AccountMatcherApp:
         # ---- Button bar ----
         btn_frame = ttk.Frame(self.root)
         btn_frame.pack(fill="x", padx=10, pady=(4, 10))
-        ttk.Button(btn_frame, text="Run Matching", command=self._run).pack(side="right", padx=4)
+        self.btn_run = ttk.Button(btn_frame, text="Run Matching", command=self._run)
+        self.btn_run.pack(side="right", padx=4)
         ttk.Button(btn_frame, text="Clear All", command=self._clear).pack(side="right", padx=4)
+        self._status_var = tk.StringVar(value="")
+        ttk.Label(btn_frame, textvariable=self._status_var, foreground="gray").pack(side="right", padx=12)
 
     # ------------------------------------------------------------------
     def _clear(self):
@@ -561,33 +571,60 @@ class AccountMatcherApp:
             messagebox.showwarning("No Data", "No rows were found in Source B.")
             return
 
-        try:
-            result_tsv = solve_for_targets(
-                source_a, source_b, use_last_only,
-                k_alternatives=k_alternatives,
-                required_count=required_count,
-                best_per_count=best_per_count,
-            )
-        except Exception as e:
-            messagebox.showerror("Matching Error", str(e))
-            return
+        # Disable button and show status while the algorithm runs in background
+        self.btn_run.config(state="disabled")
+        self._status_var.set("Running...")
+        start_ts = time.perf_counter()
 
-        self._show_results(result_tsv)
+        result_q: "queue.Queue[tuple]" = queue.Queue()
 
-    def _show_results(self, tsv: str):
+        def _worker():
+            try:
+                tsv = solve_for_targets(
+                    source_a, source_b, use_last_only,
+                    k_alternatives=k_alternatives,
+                    required_count=required_count,
+                    best_per_count=best_per_count,
+                )
+                result_q.put(("ok", tsv))
+            except Exception as exc:
+                result_q.put(("err", str(exc)))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+        def _poll():
+            try:
+                status, data = result_q.get_nowait()
+            except queue.Empty:
+                self.root.after(100, _poll)
+                return
+            elapsed = time.perf_counter() - start_ts
+            self.btn_run.config(state="normal")
+            self._status_var.set(f"Done in {elapsed:.2f}s")
+            if status == "ok":
+                self._show_results(data, elapsed)
+            else:
+                messagebox.showerror("Matching Error", data)
+
+        self.root.after(100, _poll)
+
+    def _show_results(self, tsv: str, elapsed: float):
         win = tk.Toplevel(self.root)
-        win.title("Results")
+        win.title(f"Results  ({elapsed:.2f}s)")
         win.geometry("820x520")
         win.resizable(True, True)
 
+        header = f"# Computed in {elapsed:.3f} seconds\n\n"
+        full_text = header + tsv
+
         txt = scrolledtext.ScrolledText(win, wrap=tk.NONE, font=("Courier New", 9))
         txt.pack(fill="both", expand=True, padx=10, pady=(10, 4))
-        txt.insert("1.0", tsv)
+        txt.insert("1.0", full_text)
         txt.config(state="disabled")
 
         def _copy():
             self.root.clipboard_clear()
-            self.root.clipboard_append(tsv)
+            self.root.clipboard_append(tsv)   # copy TSV only, without the comment header
             messagebox.showinfo("Copied", "Results copied to clipboard.", parent=win)
 
         bar = ttk.Frame(win)
