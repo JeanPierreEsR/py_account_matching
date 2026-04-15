@@ -430,6 +430,7 @@ def solve_for_targets(
 
                 if dim == 1:
                     best_sum, idxs = match
+                    used = set(idxs)
                     diff = best_sum - a_vals[0]
                     idx_set = set(idxs)
                     lines.append(f"BEST_TOTAL\t{best_sum:.6f}\tDIFF\t{diff:.6f}")
@@ -439,6 +440,7 @@ def solve_for_targets(
                         lines.append(f"{nb}\t{vb[0]:.6f}\t{flag}")
                 else:
                     best_sum, idxs = match
+                    used = set(idxs)
                     diffs = [best_sum[d] - a_vals[d] for d in range(dim)]
                     idx_set = set(idxs)
                     lines.append("BEST_TOTAL\t\t" + "\t".join(f"{x:.6f}" for x in best_sum))
@@ -672,12 +674,14 @@ def _main_cli():
         if not source_b:
             print("No Source B (accounts to loop through) data provided. Exiting.")
             return
+        t_start = time.time()
 
         result_tsv = solve_for_targets(
             source_a, source_b, use_last_only,
             k_alternatives=k_alternatives,
             required_count=required_count,
             best_per_count=best_per_count,
+            t_start=t_start,
         )
         input("Results ready. Press Enter to copy to clipboard...")
         write_clipboard_text(result_tsv)
