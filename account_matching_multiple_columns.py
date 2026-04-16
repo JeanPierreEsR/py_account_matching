@@ -437,7 +437,7 @@ def solve_for_targets(
                     lines.append(f"COUNT\t{len(idxs)}")
                     for i, (nb, vb) in enumerate(zip(names_b, vals_b)):
                         flag = 1 if i in idx_set else 0
-                        lines.append(f"{nb}\t{vb[0]:.6f}\t{flag}")
+                        lines.append(f"{nb}\t{flag}\t{vb[0]:.6f}")
                 else:
                     best_sum, idxs = match
                     used = set(idxs)
@@ -448,7 +448,7 @@ def solve_for_targets(
                     lines.append(f"COUNT\t\t{len(idxs)}")
                     for i, (nb, vb) in enumerate(zip(names_b, vals_b)):
                         flag = 1 if i in idx_set else 0
-                        lines.append(f"{nb}\t\t" + "\t".join(f"{x:.6f}" for x in vb) + f"\t{flag}")
+                        lines.append(f"{nb}\t{flag}\t" + "\t".join(f"{x:.6f}" for x in vb))
 
         lines.append("")
 
