@@ -436,6 +436,7 @@ def solve_for_targets(
                     lines.append(f"BEST_TOTAL\t\t{best_sum:.6f}")
                     lines.append(f"DIFF\t\t{diff:.6f}")
                     lines.append(f"COUNT\t\t{len(idxs)}")
+                    lines.append("")
                     for i, (nb, vb) in enumerate(zip(names_b, vals_b)):
                         flag = 1 if i in idx_set else 0
                         lines.append(f"{nb}\t{flag}\t{vb[0]:.6f}")
@@ -447,6 +448,7 @@ def solve_for_targets(
                     lines.append("BEST_TOTAL\t\t" + "\t".join(f"{x:.6f}" for x in best_sum))
                     lines.append("DIFF\t\t" + "\t".join(f"{x:.6f}" for x in diffs))
                     lines.append(f"COUNT\t\t{len(idxs)}")
+                    lines.append("")
                     for i, (nb, vb) in enumerate(zip(names_b, vals_b)):
                         flag = 1 if i in idx_set else 0
                         lines.append(f"{nb}\t{flag}\t" + "\t".join(f"{x:.6f}" for x in vb))
